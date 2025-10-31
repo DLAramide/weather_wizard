@@ -1,0 +1,49 @@
+# --- PYTHON BASICS ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.sqlite3
+
+# --- VIRTUAL ENVIRONMENTS ---
+# Ignore all virtual environments and build folders
+zeus/
+env/
+.venv/
+venv/
+ENV/
+.ENV/
+
+# --- PROJECT SETTINGS & TOOLS ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- OS FILES ---
+.DS_Store
+Thumbs.db
+
+# --- CACHE & LOGS ---
+*.log
+*.cache/
+.cache/
+*.tmp
+
+# --- JUPYTER NOTEBOOKS ---
+.ipynb_checkpoints/
+
+# --- TEST & BUILD OUTPUT ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- DATA & MISC ---
+*.csv
+*.json
+*.db
+*.zip
+*.tar.gz
+*.h5
+*.parquet
