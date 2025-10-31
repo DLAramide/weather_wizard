@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.pkl
+
 *.sqlite3
 
 # --- VIRTUAL ENVIRONMENTS ---
@@ -45,5 +45,5 @@ dist/
 *.db
 *.zip
 *.tar.gz
-*.h5
+
 *.parquet
