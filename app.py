@@ -26,14 +26,25 @@ TARGET_COL = "PRECTOTCORR"
 # ------------------------
 # Helper function for inverse
 # ------------------------
-def inverse_transform_prediction(pred_scaled, scaler, last_scaled_row):
+def inverse_transform_prediction(pred_scaled, scaler, last_row_scaled):
     """
-    Convert scaled log1p prediction back to original units safely
+    Reverse MinMax scaling and log1p transformation for the target.
+    pred_scaled: output of model in scaled space
+    scaler: fitted MinMaxScaler used on the features (including log_PRECTOTCORR)
+    last_row_scaled: the last row of input scaled data (needed to preserve scaling shape)
     """
-    row = last_scaled_row.copy()
-    row[0, -1] = pred_scaled  # replace target only
-    inv_scaled = scaler.inverse_transform(row)[0, -1]
-    return np.expm1(inv_scaled)  # inverse of log1p
+    # Copy last row and replace target column with prediction
+    temp = last_row_scaled.copy()
+    temp[0, -1] = pred_scaled  # Assuming target is last column
+
+    # Inverse MinMax scaling
+    temp_inv = scaler.inverse_transform(temp)
+    pred_log = temp_inv[0, -1]  # Extract the target (log-transformed) column
+
+    # Reverse log1p
+    rainfall_mm = np.expm1(pred_log)
+    return rainfall_mm
+
 
 # ------------------------
 # Prediction endpoint
@@ -130,70 +141,59 @@ def predict_rainfall(days: int = 1, latitude: float = 6.585, longitude: float = 
         "forecasts": forecasts,
         "location": {"latitude": latitude, "longitude": longitude}
     }
-
-
 @app.get("/predict_monthly")
 def predict_monthly(months: int = 1, latitude: float = 6.585, longitude: float = 3.983):
-    """
-    Predict rainfall for 'months' ahead using NASA POWER monthly data.
-    Example: /predict_monthly?months=3
-    """
-
-    # 1️⃣ Fetch recent NASA monthly weather data
+    # --- Step 1: Fetch NASA monthly data ---
     df = fetch_nasa_monthly_data(latitude, longitude)
-
-    # 2️⃣ Basic cleanup — remove annual rows, map months, build date
-    df = df[df['MONTH'] != 'ANN'].copy()
-    month_map = {
-        'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
-        'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12
-    }
-    df['MONTH_NUM'] = df['MONTH'].map(month_map)
-    df['DATE'] = pd.to_datetime(df['YEAR'].astype(str) + '-' + df['MONTH_NUM'].astype(str) + '-01')
-    df = df.sort_values('DATE').reset_index(drop=True)
-
-    # 3️⃣ Ensure all required features exist
+    
+    # Replace NASA missing flags and forward/backward fill
+    df = df.replace(-999.0, np.nan).ffill().bfill()
+    
+    # Reset index for convenience
+    df.reset_index(inplace=True)
+    df.rename(columns={'index': 'DATE'}, inplace=True)
+    
+    # Ensure all required features exist
     for col in FEATURES + [TARGET_COL]:
         if col not in df.columns:
             df[col] = 0
 
-    # 4️⃣ Fill missing, clip negatives
-    for col in FEATURES + [TARGET_COL]:
-        df[col] = df[col].fillna(0)
-        df[col] = df[col].clip(lower=0)
-
-    # 5️⃣ Log-transform
+    # --- Step 2: Log-transform features ---
     df["log_PRECTOTCORR"] = np.log1p(df[TARGET_COL])
     for col in FEATURES:
         df[f"log_{col}"] = np.log1p(df[col])
 
-    # 6️⃣ Lag and rolling features (for monthly)
-    for lag in [1, 2, 3]:
+    # --- Step 3: Create lag features ---
+    for lag in [1, 3, 7]:
         df[f"log_PRECTOTCORR_lag{lag}"] = df["log_PRECTOTCORR"].shift(lag)
+
+    # --- Step 4: Rolling features ---
     df["rain_rolling_mean"] = df["log_PRECTOTCORR"].rolling(window=3).mean()
     df["rain_rolling_std"] = df["log_PRECTOTCORR"].rolling(window=3).std()
+    
+    # Drop rows with NaNs due to lags/rolling
     df = df.dropna().copy()
+    
+    if len(df) < 7:
+        return {"error": "Not enough data to compute lag7 for monthly prediction."}
 
-    # 7️⃣ Check data sufficiency
-    if len(df) < 6:
-        return {"error": "Not enough data to make monthly prediction."}
-
-    # 8️⃣ Final feature list
+    # --- Step 5: Prepare prediction window ---
     final_features = [f"log_{col}" for col in FEATURES] + [
-        "log_PRECTOTCORR_lag1", "log_PRECTOTCORR_lag2", "log_PRECTOTCORR_lag3",
+        "log_PRECTOTCORR_lag1", "log_PRECTOTCORR_lag3", "log_PRECTOTCORR_lag7",
         "rain_rolling_mean", "rain_rolling_std"
     ]
-
-    # 9️⃣ Use last 6 months as window
-    window = df[final_features + ["log_PRECTOTCORR"]].tail(6).copy()
+    window = df[final_features + ["log_PRECTOTCORR"]].tail(7).copy()
+    
     forecasts = []
-
     for month in range(1, months + 1):
+        # Scale features
         scaled = scaler_monthly.transform(window)
         X_input = np.expand_dims(scaled, axis=0)
-
-        # Predict rainfall
+        
+        # Predict (scaled/log space)
         pred_scaled = model_monthly.predict(X_input)
+        
+        # --- Step 6: Inverse transform to mm ---
         rainfall_mm = inverse_transform_prediction(pred_scaled, scaler, scaled[-1:].reshape(1, -1))
         rainfall_mm = max(0, rainfall_mm)
 
@@ -202,30 +202,79 @@ def predict_monthly(months: int = 1, latitude: float = 6.585, longitude: float =
             "predicted_rainfall_mm": round(float(rainfall_mm), 3)
         })
 
-        # --- Update for next iteration ---
-        new_row = {}
-        for col in final_features:
-            if col != "log_PRECTOTCORR":
-                new_row[col] = window[col].iloc[-1]
+        # --- Step 7: Update window for next month ---
+        new_row = {col: window[col].iloc[-1] for col in final_features if col != "log_PRECTOTCORR"}
+        lag_values = [window["log_PRECTOTCORR"].iloc[-lag] for lag in [1,3,7]]
+        new_row.update({
+            "log_PRECTOTCORR_lag1": lag_values[0],
+            "log_PRECTOTCORR_lag3": lag_values[1],
+            "log_PRECTOTCORR_lag7": lag_values[2],
+            "rain_rolling_mean": np.mean(list(window["log_PRECTOTCORR"].iloc[-2:]) + [np.log1p(rainfall_mm)]),
+            "rain_rolling_std": np.std(list(window["log_PRECTOTCORR"].iloc[-2:]) + [np.log1p(rainfall_mm)]),
+            "log_PRECTOTCORR": np.log1p(rainfall_mm)
+        })
 
-        # Update lags
-        lag_values = [window["log_PRECTOTCORR"].iloc[-lag] for lag in [1, 2, 3]]
-        new_row["log_PRECTOTCORR_lag1"] = lag_values[0]
-        new_row["log_PRECTOTCORR_lag2"] = lag_values[1]
-        new_row["log_PRECTOTCORR_lag3"] = lag_values[2]
+        window = pd.concat([window, pd.DataFrame([new_row])], ignore_index=True).tail(7)
 
-        # Rolling updates
-        rolling_window = list(window["log_PRECTOTCORR"].iloc[-2:]) + [np.log1p(rainfall_mm)]
-        new_row["rain_rolling_mean"] = np.mean(rolling_window)
-        new_row["rain_rolling_std"] = np.std(rolling_window)
+    return {"monthly_forecasts": forecasts, "location": {"latitude": latitude, "longitude": longitude}}
 
-        # Add new prediction
-        new_row["log_PRECTOTCORR"] = np.log1p(rainfall_mm)
+@app.get("/debug_prediction")
+def debug_prediction(latitude: float = 6.585, longitude: float = 3.983):
+    # 1️⃣ Fetch NASA monthly data
+    df = fetch_nasa_monthly_data(latitude, longitude)
+    df = df.replace(-999.0, np.nan).ffill().bfill()
+    df.reset_index(inplace=True)
+    df.rename(columns={'index': 'DATE'}, inplace=True)
 
-        window = pd.concat([window, pd.DataFrame([new_row])], ignore_index=True)
-        window = window.tail(6)
+    # 2️⃣ Ensure all required features exist
+    for col in FEATURES + [TARGET_COL]:
+        if col not in df.columns:
+            df[col] = 0
+
+    # 3️⃣ Log-transform features
+    df["log_PRECTOTCORR"] = np.log1p(df[TARGET_COL])
+    for col in FEATURES:
+        df[f"log_{col}"] = np.log1p(df[col])
+
+    # 4️⃣ Create lag features (1,3,7)
+    for lag in [1, 3, 7]:
+        df[f"log_PRECTOTCORR_lag{lag}"] = df["log_PRECTOTCORR"].shift(lag)
+
+    # 5️⃣ Rolling features
+    df["rain_rolling_mean"] = df["log_PRECTOTCORR"].rolling(window=3).mean()
+    df["rain_rolling_std"] = df["log_PRECTOTCORR"].rolling(window=3).std()
+
+    # 6️⃣ Drop rows with NaNs from lag/rolling features
+    df = df.dropna().copy()
+    if len(df) < 7:
+        return {"error": "Not enough data to compute lag7 for debug prediction."}
+
+    # 7️⃣ Prepare feature set exactly matching scaler
+    final_features_scaler = [f"log_{col}" for col in FEATURES] + [
+        "log_PRECTOTCORR_lag1", "log_PRECTOTCORR_lag3", "log_PRECTOTCORR_lag7",
+        "rain_rolling_mean", "rain_rolling_std",
+        "log_PRECTOTCORR"  # include target if scaler was fitted with it
+    ]
+
+    # Select last row for prediction
+    last_row = df[final_features_scaler].tail(1)
+    
+    # 8️⃣ Scale
+    scaled_features = scaler_monthly.transform(last_row.values)
+    print("Scaled features:", scaled_features)
+
+    # 9️⃣ Predict
+    X_input = np.expand_dims(scaled_features, axis=0)
+    pred_scaled = model_monthly.predict(X_input)
+    print("Predicted scaled rainfall:", pred_scaled)
+
+    # 10️⃣ Inverse-transform to mm
+    rainfall_mm = inverse_transform_prediction(pred_scaled, scaler, scaled_features)
+    rainfall_mm = max(0, rainfall_mm)
 
     return {
-        "monthly_forecasts": forecasts,
+        "predicted_scaled": pred_scaled.tolist(),
+        "predicted_mm": round(float(rainfall_mm), 3),
+        "scaled_features": scaled_features.tolist(),
         "location": {"latitude": latitude, "longitude": longitude}
     }
